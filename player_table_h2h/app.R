@@ -4,6 +4,7 @@ library(shiny)
 library(ggplot2)
 library(tidyverse)
 library(XML)
+library(RColorBrewer)
 
 # user options:
 #     1) select player 1 (selectbox 1 or more)
@@ -34,13 +35,15 @@ parse_XML <- function(path) {
     return(list(player_vec, match_df))
 }
 
+div_cols <- brewer.pal(11, 'Spectral')
+
 # BCN_load<-parse_XML('data/season_11.bcn')
 
 # user interface module
 ui <- fluidPage(
 
     # add title to UI
-    titlePanel("Snappy title, wow!!!!"),
+    titlePanel("Player record inspector"),
     hr(), 
 
     # main area
@@ -81,10 +84,19 @@ ui <- fluidPage(
                 tabPanel('Set list', tableOutput('one')),
 
                 # second tab is head to head
-                tabPanel('Head to head table', textOutput('two')),
+                tabPanel('Head to head table', 
+                    p('P1 selections are placed on the columns. P1 and P2 selections are placed on the rows to allow for easy viewing of P1 vs P1 head to head set counts.'),
+                    p('Read set counts as "[Column wins] - [Row wins]" -- sorry if this is unintuitive if you are used to more typical matrix[row, col] notation, but this way it is easier to select a P1 and just scan down their column, seeing how they did against opponents from the P1 point of view.'),
+                    p('If you are looking at a lot of players at a time, the next tab (heatmaps) might be a better view.'),
+                    tableOutput('two')),
 
                 # third tab are heatmaps
-                tabPanel('Head to head heatmaps', textOutput('three'))
+                tabPanel('Head to head heatmaps', 
+                    p('Heatmap views for player match ups. W/L differential and win percentage are reported from the P1 point of view. Blues and greens mean P1 is doing well, and oranges and reds mean P1 is doing poorly against a given opponent.'),
+                    p('If you are looking at a small number of players, the previous tab (table) might be a better view.'),
+                    plotOutput('three'), 
+                    br(),
+                    plotOutput('four'))
             )
         ) 
     )
@@ -129,7 +141,7 @@ server <- function(input, output) {
 
     # create dynamic UI element for P2 selection
     output$P2select <- renderUI({
-        selectInput('P2', 'Select one or more players to generate head to head records against. These will be referred to as "P2"', choices=trim_player_list(), multiple = TRUE)
+        selectInput('P2', 'Select players to generate additional head to head records against. These will be referred to as "P2"', choices=trim_player_list(), multiple = TRUE)
     })
 
     # generate subsetted match list based on P1 selections
@@ -163,46 +175,81 @@ server <- function(input, output) {
     # transform set list into set counts
     set_list_to_counts <- reactive({
         P1_list <- input$P1
-        P2_list <- c(input$P1, input$P2)
-        set_count_df <- as.data.frame(matrix(0, nrow=length(P1_list), ncol=length(P2_list)))
-        dimnames(set_count_df) <- list(P1_list, P2_list)
+        if (input$P2_focused == 'ALL') {
+            P2_opponents <- sort(unique(c(trim_matches_to_p2()[,1], trim_matches_to_p2()[,2])))
+            P2_opponents <- P2_opponents[-(which(P2_opponents %in% P1_list))]
+            P2_list <- c(P1_list, P2_opponents)
+        } else { P2_list <- c(input$P1, input$P2) }
+        set_count_df <- as.data.frame(matrix(0, nrow=length(P2_list), ncol=length(P1_list)))
+        dimnames(set_count_df) <- list(P2_list, P1_list)
+        for (p1 in P1_list) {
+            for (p2 in P2_list) {
+                s_count <- trim_matches_to_p2() %>% filter(P1==p1 & P2==p2 | P2==p1 & P1==p2) %>% count(Winner) %>% as.data.frame(.)
+                rownames(s_count) <- s_count[,1]
+                if (is.na(s_count[p1,2])) { s_count[p1,2]<-0 }
+            if (is.na(s_count[p2,2])) { s_count[p2,2]<-0 }
+            set_count_df[p2, p1] <- paste(s_count[p1,2], s_count[p2,2], sep='-')
+            }
+        }
         for (i in 1:length(P1_list)) { set_count_df[i,i]<-NA }
-
+        set_count_df
     })
 
+    # transform set counts to W/L differential and W percent
+    set_counts_to_diff_prc <- reactive({
+        set_count_df <- set_list_to_counts()
+        set_diff <- as.data.frame(matrix(NA, nrow=nrow(set_count_df), ncol=ncol(set_count_df)))
+        dimnames(set_diff) <- dimnames(set_count_df)
+        # set_diff <- set_count_df
+        set_prc <- set_diff
+        for (i in 1: nrow(set_count_df)) {
+            for (j in 1:ncol(set_count_df)) {
+                if (!is.na(set_count_df[i,j])) { 
+                    s_count <- as.numeric(unlist(strsplit(set_count_df[i,j], '-')))
+                    if (all(s_count==0)) {
+                        set_diff[i,j] <- NA
+                        set_prc[i,j] <- NA
+                    } else { 
+                        set_diff[i,j] <- round(s_count[1] - s_count[2], 0)
+                        set_prc[i,j] <- round(100 * s_count[1] / (sum(s_count)), 2)
+                    }
+                } 
+            }
+        }
+        list(set_diff, set_prc)
+    })
 
+    # create heatmap for W/L differential
+    hmap_diff <- reactive({
+        diff_df <- as.data.frame(t(set_counts_to_diff_prc()[[1]])) %>% mutate(P1=rownames(.)) %>% gather(key=P2, value=WL_diff, -P1)
+        abs_max <- max(abs(diff_df[,3]), na.rm=TRUE)
+        cbar_lims <- c(-abs_max, abs_max)
+        ggplot(diff_df, aes(x=P2, y=P1)) + geom_tile(aes(fill=WL_diff), colour='grey50') + 
+        scale_fill_gradientn(colours=div_cols, na.value='grey80', limits=cbar_lims) + 
+        theme(axis.text.x=element_text(size=10, angle=45, hjust=1, vjust=1), axis.text.y=element_text(size=10)) +
+        labs(title='Heatmap of P1 Set Win/Loss Differential')
+    })
+
+    # create heatmap for W percent
+    hmap_prc <- reactive({
+        prc_df <- as.data.frame(t(set_counts_to_diff_prc()[[2]])) %>% mutate(P1=rownames(.)) %>% gather(key=P2, value=Win_prc, -P1)
+        cbar_lims <- c(0, 100)
+        ggplot(prc_df, aes(x=P2, y=P1)) + geom_tile(aes(fill=Win_prc), colour='grey50') +
+        scale_fill_gradientn(colours=div_cols, na.value='grey80', limits=cbar_lims) +
+        theme(axis.text.x=element_text(size=10, angle=45, hjust=1, vjust=1), axis.text.y=element_text(size=10)) +
+        labs(title='Heatmap of P1 Set Win Percentage')
+    })
 
     # generate set list view
     output$one <- renderTable({trim_matches_to_p2()})
 
+    # generate set count view
+    output$two <- renderTable({set_list_to_counts()}, rownames=TRUE)
 
-    output$two <- renderText({'WOW'})
-    output$three <- renderText({'u rule'})
+    # generate heatmaps view
+    output$three <- renderPlot({hmap_diff()})
+    output$four <- renderPlot({hmap_prc()})
 }
 
 # call the app to run it
 shinyApp(ui = ui, server = server)
-
-
-P1_list <- input$P1
-P2_list <- c(input$P1, input$P2)
-set_count_df <- as.data.frame(matrix(0, nrow=length(P2_list), ncol=length(P1_list)))
-dimnames(set_count_df)<-list(P2_list, P1_list)
-for (i in 1:length(P1_list)) { set_count_df[i,i]<-NA }
-
-
-
-p1_list
-p2_list
-tim (p1 v p2)
-tom (p1 v p1)
-tam (rbind)
-
-columns = p1_list
-rows = c(p1_list, p2_list)
-
-
-
-
-
-
